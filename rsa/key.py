@@ -25,9 +25,13 @@ of pyasn1.
 
 '''
 
+import logging
+
 import rsa.prime
 import rsa.pem
+import rsa.common
 
+log = logging.getLogger(__name__)
 
 class PublicKey(object):
     '''Represents a public RSA key.
@@ -108,12 +112,12 @@ class PrivateKey(object):
 
         # Calculate the other values if they aren't supplied
         if exp1 is None:
-            self.exp1 = d % (p - 1)
+            self.exp1 = long(d % (p - 1))
         else:
             self.exp1 = exp1
 
         if exp1 is None:
-            self.exp2 = d % (q - 1)
+            self.exp2 = long(d % (q - 1))
         else:
             self.exp2 = exp2
 
@@ -277,13 +281,24 @@ def extended_gcd(a, b):
     if (ly < 0): ly += oa              #If neg wrap modulo orignal a
     return (a, lx, ly)                 #Return only positive values
 
-def find_p_q(nbits):
+def find_p_q(nbits, accurate=True):
     ''''Returns a tuple of two different primes of nbits bits each.
     
+    The resulting p * q has exacty 2 * nbits bits, and the returned p and q
+    will not be equal.
+
+    @param nbits: the number of bits in each of p and q.
+    @param accurate: whether to enable accurate mode or not.
+    @returns (p, q), where p > q
+
     >>> (p, q) = find_p_q(128)
-    
-    The resulting p and q should be very close to 2*nbits bits, and no more
-    than 2*nbits bits:
+    >>> from rsa import common
+    >>> common.bit_size(p * q)
+    256
+
+    When not in accurate mode, the number of bits can be slightly less
+
+    >>> (p, q) = find_p_q(128, accurate=False)
     >>> from rsa import common
     >>> common.bit_size(p * q) <= 256
     True
@@ -292,21 +307,55 @@ def find_p_q(nbits):
     
     '''
     
+    total_bits = nbits * 2
+
     # Make sure that p and q aren't too close or the factoring programs can
     # factor n.
     shift = nbits // 16
     pbits = nbits + shift
     qbits = nbits - shift
     
+    # Choose the two initial primes
+    log.debug('find_p_q(%i): Finding p', nbits)
     p = rsa.prime.getprime(pbits)
-    
-    while True:
-        q = rsa.prime.getprime(qbits)
+    log.debug('find_p_q(%i): Finding q', nbits)
+    q = rsa.prime.getprime(qbits)
 
-        # Make sure p and q are different.
-        if q != p: break
-        
-    return (p, q)
+    def is_acceptable(p, q):
+        '''Returns True iff p and q are acceptable:
+            
+            - p and q differ
+            - (p * q) has the right nr of bits (when accurate=True)
+        '''
+
+        if p == q:
+            return False
+
+        if not accurate:
+            return True
+
+        # Make sure we have just the right amount of bits
+        found_size = rsa.common.bit_size(p * q)
+        return total_bits == found_size
+
+    # Keep choosing other primes until they match our requirements.
+    change_p = False
+    tries = 0
+    while not is_acceptable(p, q):
+        tries += 1
+        # Change p on one iteration and q on the other
+        if change_p:
+            log.debug('   find another p')
+            p = rsa.prime.getprime(pbits)
+        else:
+            log.debug('   find another q')
+            q = rsa.prime.getprime(qbits)
+
+        change_p = not change_p
+
+    # We want p > q as described on
+    # http://www.di-mgt.com.au/rsa_alg.html#crt
+    return (max(p, q), min(p, q))
 
 def calculate_keys(p, q, nbits):
     """Calculates an encryption and a decryption key given p and q, and
@@ -333,7 +382,7 @@ def calculate_keys(p, q, nbits):
 
     return (e, d)
 
-def gen_keys(nbits):
+def gen_keys(nbits, accurate=True):
     """Generate RSA keys of nbits bits. Returns (p, q, e, d).
 
     Note: this can take a long time, depending on the key size.
@@ -342,12 +391,12 @@ def gen_keys(nbits):
         ``q`` will use ``nbits/2`` bits.
     """
 
-    (p, q) = find_p_q(nbits // 2)
+    (p, q) = find_p_q(nbits // 2, accurate)
     (e, d) = calculate_keys(p, q, nbits // 2)
 
     return (p, q, e, d)
 
-def newkeys(nbits):
+def newkeys(nbits, accurate=True):
     """Generates public and private keys, and returns them as (pub, priv).
 
     The public key is also known as the 'encryption key', and is a PublicKey
@@ -355,6 +404,8 @@ def newkeys(nbits):
     PrivateKey object.
     
     @param nbits: the number of bits required to store ``n = p*q``.
+    @param accurate: when True, ``n`` will have exactly the number of bits you
+        asked for. However, this makes key generation much slower.
 
     @return: a tuple (PublicKey, PrivateKey)
     
